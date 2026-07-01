@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""
+Codex History Guard.
+
+Archive, index, search, and restore Codex Desktop chat history across model,
+provider, CC Switch, or API-key/OAuth login changes.
+
+The tool reads local Codex history files only. It does not call model APIs, does
+not use tokens, and intentionally does not copy auth.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+DEFAULT_VAULT = Path(os.environ.get("CODEX_HISTORY_VAULT", "~/.codex-history-vault")).expanduser()
+DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def stable_source_id(path: Path) -> str:
+    resolved = str(path.expanduser().resolve())
+    digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:10]
+    name = path.name or "codex"
+    return f"{name}-{digest}"
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def copy_if_changed(src: Path, dst: Path) -> bool:
+    ensure_dir(dst.parent)
+    if dst.exists():
+        try:
+            s_stat = src.stat()
+            d_stat = dst.stat()
+            if s_stat.st_size == d_stat.st_size and int(s_stat.st_mtime) <= int(d_stat.st_mtime):
+                return False
+        except OSError:
+            pass
+    shutil.copy2(src, dst)
+    return True
+
+
+def iter_files(root: Path) -> Iterable[Path]:
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        if path.is_file():
+            yield path
+
+
+def copy_tree_incremental(src_root: Path, dst_root: Path) -> int:
+    count = 0
+    if not src_root.exists():
+        return 0
+    for src in iter_files(src_root):
+        rel = src.relative_to(src_root)
+        if copy_if_changed(src, dst_root / rel):
+            count += 1
+    return count
+
+
+def backup_sqlite_file(src: Path, dst: Path) -> bool:
+    ensure_dir(dst.parent)
+    try:
+        uri = f"file:{src}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as source, sqlite3.connect(dst) as target:
+            source.backup(target)
+        return True
+    except Exception:
+        try:
+            shutil.copy2(src, dst)
+            for suffix in ("-wal", "-shm"):
+                side = Path(str(src) + suffix)
+                if side.exists():
+                    shutil.copy2(side, Path(str(dst) + suffix))
+            return True
+        except Exception:
+            return False
+
+
+def extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        typ = item.get("type")
+        if typ in {"input_text", "output_text", "text"}:
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def is_boilerplate_message(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("<environment_context>") or stripped.startswith("# AGENTS.md instructions")
+
+
+@dataclass
+class SessionSummary:
+    session_id: str
+    title: str
+    first_ts: str
+    last_ts: str
+    cwd: str
+    model_provider: str
+    source_id: str
+    archive_path: str
+    original_relpath: str
+    user_messages: int
+    assistant_messages: int
+    searchable_text: str
+
+
+def summarize_session(path: Path, source_id: str, archive_root: Path) -> SessionSummary | None:
+    session_id = ""
+    first_ts = ""
+    last_ts = ""
+    cwd = ""
+    model_provider = ""
+    title = ""
+    user_messages = 0
+    assistant_messages = 0
+    search_parts: list[str] = []
+
+    try:
+        rel = str(path.relative_to(archive_root))
+    except ValueError:
+        rel = path.name
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                ts = event.get("timestamp") or ""
+                if ts:
+                    first_ts = first_ts or ts
+                    last_ts = ts
+
+                if event.get("type") == "session_meta":
+                    payload = event.get("payload") or {}
+                    if isinstance(payload, dict):
+                        session_id = session_id or str(payload.get("id") or payload.get("session_id") or "")
+                        cwd = str(payload.get("cwd") or cwd or "")
+                        model_provider = str(payload.get("model_provider") or model_provider or "")
+                    continue
+
+                if event.get("type") != "response_item":
+                    continue
+                payload = event.get("payload") or {}
+                if not isinstance(payload, dict) or payload.get("type") != "message":
+                    continue
+                role = payload.get("role")
+                if role not in {"user", "assistant"}:
+                    continue
+                text = extract_text(payload.get("content"))
+                if not text:
+                    continue
+                if role == "user":
+                    user_messages += 1
+                    if not title and not is_boilerplate_message(text):
+                        title = " ".join(text.split())[:120]
+                elif role == "assistant":
+                    assistant_messages += 1
+                if not is_boilerplate_message(text):
+                    search_parts.append(f"{role}: {text}")
+    except OSError:
+        return None
+
+    if not session_id:
+        session_id = path.stem.replace("rollout-", "")
+    if not title:
+        title = Path(cwd).name if cwd else path.stem
+
+    return SessionSummary(
+        session_id=session_id,
+        title=title,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        cwd=cwd,
+        model_provider=model_provider,
+        source_id=source_id,
+        archive_path=str(path),
+        original_relpath=rel,
+        user_messages=user_messages,
+        assistant_messages=assistant_messages,
+        searchable_text="\n".join(search_parts),
+    )
+
+
+def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
+    ensure_dir(path.parent)
+    count = 0
+    with path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            count += 1
+    return count
+
+
+def rebuild_index(vault: Path) -> int:
+    rows: list[dict[str, Any]] = []
+    sessions_root = vault / "sources"
+    if sessions_root.exists():
+        for source_dir in sessions_root.iterdir():
+            if not source_dir.is_dir():
+                continue
+            archive_root = source_dir / "sessions"
+            for path in archive_root.rglob("*.jsonl"):
+                summary = summarize_session(path, source_dir.name, archive_root)
+                if not summary:
+                    continue
+                rows.append(
+                    {
+                        "session_id": summary.session_id,
+                        "title": summary.title,
+                        "first_ts": summary.first_ts,
+                        "last_ts": summary.last_ts,
+                        "cwd": summary.cwd,
+                        "model_provider": summary.model_provider,
+                        "source_id": summary.source_id,
+                        "archive_path": summary.archive_path,
+                        "original_relpath": summary.original_relpath,
+                        "user_messages": summary.user_messages,
+                        "assistant_messages": summary.assistant_messages,
+                        "searchable_text": summary.searchable_text,
+                    }
+                )
+    rows.sort(key=lambda r: r.get("last_ts") or r.get("first_ts") or "", reverse=True)
+    count = write_jsonl(vault / "index.jsonl", rows)
+    write_search_md(vault, rows[:300])
+    return count
+
+
+def write_search_md(vault: Path, rows: list[dict[str, Any]]) -> None:
+    path = vault / "search.md"
+    ensure_dir(path.parent)
+    lines = [
+        "# Codex History Vault",
+        "",
+        f"Updated: {iso_now()}",
+        "",
+        "| Time | Title | Source | CWD | Thread |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        title = str(row.get("title") or "").replace("|", "\\|").replace("\n", " ")
+        cwd = str(row.get("cwd") or "").replace("|", "\\|")
+        lines.append(
+            f"| {row.get('last_ts') or row.get('first_ts') or ''} | {title[:120]} | "
+            f"{row.get('source_id') or ''} | `{cwd}` | `{row.get('session_id') or ''}` |"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def read_index(vault: Path) -> list[dict[str, Any]]:
+    path = vault / "index.jsonl"
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            try:
+                rows.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def snapshot(args: argparse.Namespace) -> int:
+    vault = Path(args.vault).expanduser()
+    ensure_dir(vault)
+    sources = [Path(p).expanduser() for p in args.source]
+    manifest_rows = []
+
+    for source in sources:
+        if not source.exists():
+            print(f"skip missing source: {source}", file=sys.stderr)
+            continue
+        source_id = stable_source_id(source)
+        copied_sessions = copy_tree_incremental(source / "sessions", vault / "sources" / source_id / "sessions")
+        copied_attachments = copy_tree_incremental(source / "attachments", vault / "sources" / source_id / "attachments")
+        copied_images = copy_tree_incremental(source / "generated_images", vault / "sources" / source_id / "generated_images")
+        metadata_dst = vault / "sources" / source_id / "metadata"
+        copied_meta = 0
+        for name in ("session_index.jsonl", "history.jsonl", "models_cache.json", "config.toml.cc-switch-bak"):
+            src = source / name
+            if src.exists() and copy_if_changed(src, metadata_dst / name):
+                copied_meta += 1
+
+        sqlite_count = 0
+        if not args.skip_sqlite:
+            sqlite_src = source / "sqlite"
+            sqlite_dst = vault / "snapshots" / now_stamp() / source_id / "sqlite"
+            if sqlite_src.exists():
+                for db in sqlite_src.glob("*.sqlite"):
+                    if backup_sqlite_file(db, sqlite_dst / db.name):
+                        sqlite_count += 1
+
+        manifest_rows.append(
+            {
+                "captured_at": iso_now(),
+                "source": str(source),
+                "source_id": source_id,
+                "sessions_changed": copied_sessions,
+                "attachments_changed": copied_attachments,
+                "images_changed": copied_images,
+                "metadata_changed": copied_meta,
+                "sqlite_backups": sqlite_count,
+            }
+        )
+
+    ensure_dir(vault / "manifests")
+    manifest = vault / "manifests" / f"snapshot-{now_stamp()}.json"
+    manifest.write_text(json.dumps(manifest_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    indexed = rebuild_index(vault)
+    print(f"vault: {vault}")
+    print(f"indexed sessions: {indexed}")
+    for row in manifest_rows:
+        print(
+            f"{row['source_id']}: sessions +{row['sessions_changed']}, "
+            f"attachments +{row['attachments_changed']}, images +{row['images_changed']}, "
+            f"sqlite backups {row['sqlite_backups']}"
+        )
+    return 0
+
+
+def list_sessions(args: argparse.Namespace) -> int:
+    rows = read_index(Path(args.vault).expanduser())[: args.limit]
+    for row in rows:
+        print(f"{row.get('last_ts') or row.get('first_ts') or ''}  {row.get('session_id')}  {row.get('title')}")
+    return 0
+
+
+def search(args: argparse.Namespace) -> int:
+    query = " ".join(args.query).lower()
+    rows = read_index(Path(args.vault).expanduser())
+    hits: list[dict[str, Any]] = []
+    for row in rows:
+        haystack = "\n".join(
+            str(row.get(k) or "")
+            for k in ("session_id", "title", "cwd", "model_provider", "searchable_text")
+        ).lower()
+        if query in haystack:
+            hits.append(row)
+    for row in hits[: args.limit]:
+        print(f"{row.get('last_ts') or row.get('first_ts') or ''}  {row.get('session_id')}  {row.get('title')}")
+        print(f"  cwd: {row.get('cwd')}")
+    print(f"hits: {len(hits)}")
+    return 0
+
+
+def find_session(vault: Path, needle: str) -> dict[str, Any] | None:
+    for row in read_index(vault):
+        sid = str(row.get("session_id") or "")
+        title = str(row.get("title") or "")
+        if sid == needle or sid.startswith(needle) or needle.lower() in title.lower():
+            return row
+    return None
+
+
+def show(args: argparse.Namespace) -> int:
+    vault = Path(args.vault).expanduser()
+    row = find_session(vault, args.session)
+    if not row:
+        print(f"session not found: {args.session}", file=sys.stderr)
+        return 1
+    path = Path(str(row["archive_path"]))
+    printed = 0
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "response_item":
+                continue
+            payload = event.get("payload") or {}
+            if not isinstance(payload, dict) or payload.get("type") != "message":
+                continue
+            role = payload.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            text = extract_text(payload.get("content"))
+            if not text:
+                continue
+            print(f"\n[{role}] {event.get('timestamp') or ''}\n{text}")
+            printed += 1
+            if args.limit and printed >= args.limit:
+                break
+    return 0
+
+
+def restore(args: argparse.Namespace) -> int:
+    vault = Path(args.vault).expanduser()
+    row = find_session(vault, args.session)
+    if not row:
+        print(f"session not found: {args.session}", file=sys.stderr)
+        return 1
+    src = Path(str(row["archive_path"]))
+    dest_home = Path(args.dest).expanduser()
+    rel = Path(str(row.get("original_relpath") or src.name))
+    dst = dest_home / "sessions" / rel
+    if args.dry_run:
+        print(f"would copy {src} -> {dst}")
+        return 0
+    changed = copy_if_changed(src, dst)
+    print(f"{'restored' if changed else 'already present'}: {dst}")
+    print("Tip: restart Codex Desktop if the thread list does not refresh immediately.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Archive, search, and restore Codex Desktop chat history.")
+    parser.add_argument("--vault", default=str(DEFAULT_VAULT), help=f"history vault path (default: {DEFAULT_VAULT})")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_snapshot = sub.add_parser("snapshot", aliases=["sync"], help="incrementally archive current Codex history")
+    p_snapshot.add_argument("--source", action="append", default=[str(DEFAULT_CODEX_HOME)], help="Codex home to archive")
+    p_snapshot.add_argument("--skip-sqlite", action="store_true", help="skip SQLite snapshots for lightweight frequent sync")
+    p_snapshot.set_defaults(func=snapshot)
+
+    p_list = sub.add_parser("list", help="list archived sessions")
+    p_list.add_argument("--limit", type=int, default=30)
+    p_list.set_defaults(func=list_sessions)
+
+    p_search = sub.add_parser("search", help="search archived sessions")
+    p_search.add_argument("query", nargs="+")
+    p_search.add_argument("--limit", type=int, default=20)
+    p_search.set_defaults(func=search)
+
+    p_show = sub.add_parser("show", help="print a session transcript")
+    p_show.add_argument("session", help="session id prefix or title substring")
+    p_show.add_argument("--limit", type=int, default=0, help="max messages to print")
+    p_show.set_defaults(func=show)
+
+    p_restore = sub.add_parser("restore-session", help="restore one archived session into a Codex home")
+    p_restore.add_argument("session", help="session id prefix or title substring")
+    p_restore.add_argument("--dest", default=str(DEFAULT_CODEX_HOME), help="destination Codex home")
+    p_restore.add_argument("--dry-run", action="store_true")
+    p_restore.set_defaults(func=restore)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

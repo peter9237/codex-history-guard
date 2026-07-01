@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v codex-history-guard >/dev/null 2>&1; then
+  GUARD="$(command -v codex-history-guard)"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  GUARD="$SCRIPT_DIR/codex-history-guard"
+fi
+
+if [ "$#" -eq 0 ]; then
+  echo "Usage: codex-safe-switch <switch command and args>"
+  echo "Example: codex-safe-switch cc-switch use openai"
+  exit 2
+fi
+
+"$GUARD" snapshot --skip-sqlite
+set +e
+"$@"
+status=$?
+set -e
+"$GUARD" snapshot --skip-sqlite
+exit "$status"

@@ -609,42 +609,46 @@ def current_provider_for_source(source: Path, requested: str) -> str:
     return "openai"
 
 
-def backup_state_db(db: Path, vault: Path) -> Path:
+def backup_state_db(db: Path, vault: Path, source: Path) -> Path:
+    role = "root" if db.parent == source else "sqlite"
     backup_dir = vault / "sqlite-state-backups" / now_stamp()
-    backup_path = backup_dir / db.name
+    backup_path = backup_dir / f"{role}-{db.name}"
     if not backup_sqlite_file(db, backup_path):
         raise RuntimeError(f"failed to back up state database: {db}")
     return backup_path
 
 
-def sync_state_db(source: Path, vault: Path, provider: str) -> dict[str, Any]:
-    db = source / "sqlite" / "state_5.sqlite"
+def state_db_candidates(source: Path) -> list[Path]:
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for db in (source / "state_5.sqlite", source / "sqlite" / "state_5.sqlite"):
+        if not db.exists():
+            continue
+        try:
+            key = db.resolve()
+        except OSError:
+            key = db
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(db)
+    return candidates
+
+
+def sync_one_state_db(db: Path, source: Path, vault: Path, provider: str, records: list[StateThreadRecord]) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "db": str(db),
         "provider": provider,
-        "parsed": 0,
+        "parsed": len(records),
         "inserted": 0,
         "provider_updated": 0,
         "backup": "",
         "skipped": False,
     }
-    if not db.exists():
-        stats["skipped"] = True
-        return stats
-
-    records: list[StateThreadRecord] = []
-    sessions = source / "sessions"
-    if sessions.exists():
-        for path in sessions.rglob("*.jsonl"):
-            record = parse_state_thread(path)
-            if record:
-                record.model_provider = provider
-                records.append(record)
-    stats["parsed"] = len(records)
     if not records:
         return stats
 
-    backup_path = backup_state_db(db, vault)
+    backup_path = backup_state_db(db, vault, source)
     stats["backup"] = str(backup_path)
 
     with sqlite3.connect(db) as conn:
@@ -685,10 +689,36 @@ def sync_state_db(source: Path, vault: Path, provider: str) -> dict[str, Any]:
             )
         stats["inserted"] = conn.total_changes - before
         before = conn.total_changes
-        conn.execute("UPDATE threads SET model_provider = ? WHERE model_provider != ?", (provider, provider))
+        conn.execute("UPDATE threads SET model_provider = ? WHERE model_provider IS NULL OR model_provider != ?", (provider, provider))
         stats["provider_updated"] = conn.total_changes - before
         conn.commit()
     return stats
+
+
+def sync_state_dbs(source: Path, vault: Path, provider: str) -> list[dict[str, Any]]:
+    sessions = source / "sessions"
+    records: list[StateThreadRecord] = []
+    if sessions.exists():
+        for path in sessions.rglob("*.jsonl"):
+            record = parse_state_thread(path)
+            if record:
+                record.model_provider = provider
+                records.append(record)
+
+    dbs = state_db_candidates(source)
+    if not dbs:
+        return [
+            {
+                "db": str(source / "state_5.sqlite"),
+                "provider": provider,
+                "parsed": len(records),
+                "inserted": 0,
+                "provider_updated": 0,
+                "backup": "",
+                "skipped": True,
+            }
+        ]
+    return [sync_one_state_db(db, source, vault, provider, records) for db in dbs]
 
 
 def mirror(args: argparse.Namespace) -> int:
@@ -705,14 +735,15 @@ def mirror(args: argparse.Namespace) -> int:
         )
         if args.sync_state_db:
             provider = current_provider_for_source(source, args.state_provider)
-            state_stats = sync_state_db(source, vault, provider)
-            if state_stats.get("skipped"):
-                print(f"state db skipped: {state_stats['db']}")
-            else:
-                print(
-                    f"state db synced: parsed {state_stats['parsed']}, inserted {state_stats['inserted']}, "
-                    f"provider relabeled {state_stats['provider_updated']} -> {state_stats['provider']}"
-                )
+            for state_stats in sync_state_dbs(source, vault, provider):
+                if state_stats.get("skipped"):
+                    print(f"state db skipped: {state_stats['db']}")
+                else:
+                    print(
+                        f"state db synced: {state_stats['db']}: parsed {state_stats['parsed']}, "
+                        f"inserted {state_stats['inserted']}, provider relabeled {state_stats['provider_updated']} "
+                        f"-> {state_stats['provider']}"
+                    )
     return 0
 
 

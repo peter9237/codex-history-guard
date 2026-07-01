@@ -52,6 +52,8 @@
 
 这个模式会先备份 `state_5.sqlite`，再从 `sessions/*.jsonl` 补齐缺失线程，并把侧边栏线程的 `model_provider` 重标成当前 Codex provider。当前 provider 会优先从 `config.toml` 判断；如果你使用 CC Switch，则会参考 CC Switch 当前选中的 Codex provider。这样在 CC Switch/custom 和 OpenAI 之间切换时，侧边栏不会因为 provider 过滤而变空。
 
+Codex Desktop 新版本的 app-server 主要使用 `~/.codex/state_5.sqlite`；部分旧状态或兼容路径还会出现 `~/.codex/sqlite/state_5.sqlite`。`--sync-state-db` 会同时处理这两处。运行中的 app-server 可能已经缓存了线程列表，所以如果侧边栏没有立刻刷新，完全退出并重启 Codex Desktop 后再看。
+
 ## macOS 自动同步安装
 
 ```bash

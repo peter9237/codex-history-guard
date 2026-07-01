@@ -14,10 +14,10 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-"$GUARD" snapshot --skip-sqlite
+"$GUARD" mirror --skip-sqlite
 set +e
 "$@"
 status=$?
 set -e
-"$GUARD" snapshot --skip-sqlite
+"$GUARD" mirror --skip-sqlite
 exit "$status"

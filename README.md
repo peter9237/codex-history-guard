@@ -1,8 +1,8 @@
 # Codex History Guard
 
-一个本地的 Codex Desktop 聊天记录同步与归档工具。
+一个本地的 Codex Desktop 聊天记录同步、归档与回填工具。
 
-当你使用 CC Switch 切换模型、切换 provider，或者在 Codex 里来回切换 API Key / OAuth 登录方式时，Codex 的聊天列表有时会像“消失”了一样。Codex History Guard 的作用是把本机聊天记录持续同步到一个独立的本地归档库里，让你随时可以搜索、查看、恢复。
+当你使用 CC Switch 切换模型、切换 provider，或者在 Codex 里来回切换 API Key / OAuth 登录方式时，Codex 的聊天列表有时会像“消失”了一样。Codex History Guard 的作用是把本机聊天记录持续同步到一个独立的本地归档库里，并在后台把归档库里的记录回填到当前 Codex home，让你随时可以搜索、查看、恢复。
 
 它只读取本机文件：
 
@@ -42,7 +42,7 @@
 
 - `~/.codex/sqlite/*.sqlite`
 
-后台自动同步使用轻量模式 `--skip-sqlite`，不会每 5 分钟复制 SQLite 数据库，避免不必要的磁盘占用。
+后台自动同步使用轻量模式 `mirror --skip-sqlite`，不会每 5 分钟复制 SQLite 数据库，避免不必要的磁盘占用。
 
 ## macOS 自动同步安装
 
@@ -56,10 +56,15 @@ chmod +x scripts/*
 安装后会创建一个用户级 LaunchAgent，每 5 分钟运行一次：
 
 ```bash
-codex-history-guard snapshot --skip-sqlite
+codex-history-guard mirror --skip-sqlite
 ```
 
-也就是说，你切换 CC Switch 或 API 登录方式后，不需要手动输入命令，最多等 5 分钟，当前 Codex 数据目录里出现的新聊天记录就会被同步到归档库。
+也就是说，你切换 CC Switch 或 API 登录方式后，不需要手动输入命令，最多等 5 分钟：
+
+- 当前 Codex home 里出现的新聊天记录会被同步到归档库
+- 归档库里已有但当前 Codex home 缺失的记录会被回填回来
+
+如果 Codex Desktop 侧边栏没有马上刷新，重启 Codex Desktop 后通常就能看到已回填的记录。
 
 自定义归档目录或同步间隔：
 
@@ -75,6 +80,12 @@ CODEX_HISTORY_INTERVAL_SECONDS=600 \
 
 ```bash
 ./scripts/codex-history-guard snapshot --skip-sqlite
+```
+
+轻量同步并回填到当前 Codex home：
+
+```bash
+./scripts/codex-history-guard mirror --skip-sqlite
 ```
 
 完整同步，包括 SQLite 数据库快照：
@@ -111,7 +122,7 @@ CODEX_HISTORY_INTERVAL_SECONDS=600 \
 
 ## 包装切换命令
 
-如果你是在终端里切换模型或配置，可以用 `codex-safe-switch` 包一层。它会在切换前后各同步一次：
+如果你是在终端里切换模型或配置，可以用 `codex-safe-switch` 包一层。它会在切换前后各执行一次轻量同步和回填：
 
 ```bash
 ./scripts/codex-safe-switch cc-switch use openai
@@ -141,7 +152,7 @@ CODEX_HISTORY_INTERVAL_SECONDS=600 \
 如果某个切换工具改变了 `CODEX_HOME`，可以把多个 Codex home 都加入同步源：
 
 ```bash
-./scripts/codex-history-guard snapshot \
+./scripts/codex-history-guard mirror \
   --source "$HOME/.codex" \
   --source "$HOME/.codex-openai" \
   --source "$HOME/.codex-deepseek" \

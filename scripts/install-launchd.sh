@@ -26,7 +26,7 @@ cat > "$PLIST" <<PLIST
   <key>ProgramArguments</key>
   <array>
     <string>$BIN_DIR/codex-history-guard</string>
-    <string>snapshot</string>
+    <string>mirror</string>
     <string>--skip-sqlite</string>
   </array>
   <key>RunAtLoad</key>

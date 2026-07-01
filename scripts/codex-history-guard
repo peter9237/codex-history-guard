@@ -53,6 +53,22 @@ def copy_if_changed(src: Path, dst: Path) -> bool:
         try:
             s_stat = src.stat()
             d_stat = dst.stat()
+            if src.suffix == ".jsonl":
+                if s_stat.st_size < d_stat.st_size:
+                    return False
+                if s_stat.st_size == d_stat.st_size:
+                    return False
+                try:
+                    with src.open("rb") as src_fh, dst.open("ab") as dst_fh:
+                        src_fh.seek(d_stat.st_size)
+                        shutil.copyfileobj(src_fh, dst_fh)
+                except OSError:
+                    return False
+                try:
+                    os.utime(dst, (s_stat.st_atime, s_stat.st_mtime))
+                except OSError:
+                    pass
+                return True
             if s_stat.st_size == d_stat.st_size and int(s_stat.st_mtime) <= int(d_stat.st_mtime):
                 return False
         except OSError:
@@ -356,6 +372,66 @@ def snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def merge_jsonl_unique(src: Path, dst: Path) -> int:
+    if not src.exists():
+        return 0
+    ensure_dir(dst.parent)
+    seen: set[str] = set()
+    if dst.exists():
+        with dst.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                seen.add(raw)
+    added = 0
+    with src.open("r", encoding="utf-8", errors="replace") as src_fh, dst.open("a", encoding="utf-8") as dst_fh:
+        for raw in src_fh:
+            if raw in seen:
+                continue
+            dst_fh.write(raw)
+            seen.add(raw)
+            added += 1
+    return added
+
+
+def restore_archive_to_source(vault: Path, source: Path) -> dict[str, int]:
+    stats = {
+        "sessions_restored": 0,
+        "attachments_restored": 0,
+        "images_restored": 0,
+        "metadata_lines_added": 0,
+    }
+    sources_root = vault / "sources"
+    if not sources_root.exists():
+        return stats
+
+    for archived_source in sources_root.iterdir():
+        if not archived_source.is_dir():
+            continue
+        stats["sessions_restored"] += copy_tree_incremental(archived_source / "sessions", source / "sessions")
+        stats["attachments_restored"] += copy_tree_incremental(archived_source / "attachments", source / "attachments")
+        stats["images_restored"] += copy_tree_incremental(archived_source / "generated_images", source / "generated_images")
+
+        metadata = archived_source / "metadata"
+        stats["metadata_lines_added"] += merge_jsonl_unique(metadata / "session_index.jsonl", source / "session_index.jsonl")
+        stats["metadata_lines_added"] += merge_jsonl_unique(metadata / "history.jsonl", source / "history.jsonl")
+
+    return stats
+
+
+def mirror(args: argparse.Namespace) -> int:
+    snapshot(args)
+    vault = Path(args.vault).expanduser()
+    sources = [Path(p).expanduser() for p in args.source]
+    for source in sources:
+        ensure_dir(source)
+        stats = restore_archive_to_source(vault, source)
+        print(
+            f"restored into {source}: sessions +{stats['sessions_restored']}, "
+            f"attachments +{stats['attachments_restored']}, images +{stats['images_restored']}, "
+            f"metadata lines +{stats['metadata_lines_added']}"
+        )
+    return 0
+
+
 def list_sessions(args: argparse.Namespace) -> int:
     rows = read_index(Path(args.vault).expanduser())[: args.limit]
     for row in rows:
@@ -450,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
     p_snapshot.add_argument("--source", action="append", default=[str(DEFAULT_CODEX_HOME)], help="Codex home to archive")
     p_snapshot.add_argument("--skip-sqlite", action="store_true", help="skip SQLite snapshots for lightweight frequent sync")
     p_snapshot.set_defaults(func=snapshot)
+
+    p_mirror = sub.add_parser("mirror", help="archive current history, then restore archived sessions into each source")
+    p_mirror.add_argument("--source", action="append", default=[str(DEFAULT_CODEX_HOME)], help="Codex home to archive and backfill")
+    p_mirror.add_argument("--skip-sqlite", action="store_true", help="skip SQLite snapshots for lightweight frequent sync")
+    p_mirror.set_defaults(func=mirror)
 
     p_list = sub.add_parser("list", help="list archived sessions")
     p_list.add_argument("--limit", type=int, default=30)

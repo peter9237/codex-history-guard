@@ -44,6 +44,14 @@
 
 后台自动同步使用轻量模式 `mirror --skip-sqlite`，不会每 5 分钟复制 SQLite 数据库，避免不必要的磁盘占用。
 
+如果你希望切换 provider 后 Codex Desktop 侧边栏也能看到旧对话，需要同时同步 `state_5.sqlite` 里的 `threads` 索引：
+
+```bash
+./scripts/codex-history-guard mirror --skip-sqlite --sync-state-db
+```
+
+这个模式会先备份 `state_5.sqlite`，再从 `sessions/*.jsonl` 补齐缺失线程，并把侧边栏线程的 `model_provider` 重标成当前 Codex provider。当前 provider 会优先从 `config.toml` 判断；如果你使用 CC Switch，则会参考 CC Switch 当前选中的 Codex provider。这样在 CC Switch/custom 和 OpenAI 之间切换时，侧边栏不会因为 provider 过滤而变空。
+
 ## macOS 自动同步安装
 
 ```bash
@@ -63,6 +71,7 @@ codex-history-guard mirror --skip-sqlite
 
 - 当前 Codex home 里出现的新聊天记录会被同步到归档库
 - 归档库里已有但当前 Codex home 缺失的记录会被回填回来
+- Codex Desktop 的 SQLite 侧边栏索引会被补齐并按当前 provider 重标
 
 如果 Codex Desktop 侧边栏没有马上刷新，重启 Codex Desktop 后通常就能看到已回填的记录。
 
@@ -86,6 +95,12 @@ CODEX_HISTORY_INTERVAL_SECONDS=600 \
 
 ```bash
 ./scripts/codex-history-guard mirror --skip-sqlite
+```
+
+同步文件、回填并修复侧边栏索引：
+
+```bash
+./scripts/codex-history-guard mirror --skip-sqlite --sync-state-db
 ```
 
 完整同步，包括 SQLite 数据库快照：

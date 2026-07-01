@@ -28,6 +28,7 @@ cat > "$PLIST" <<PLIST
     <string>$BIN_DIR/codex-history-guard</string>
     <string>mirror</string>
     <string>--skip-sqlite</string>
+    <string>--sync-state-db</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

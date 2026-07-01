@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -34,6 +35,16 @@ def now_stamp() -> str:
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def iso_to_epoch(value: str) -> int:
+    if not value:
+        return 0
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except ValueError:
+        return 0
 
 
 def stable_source_id(path: Path) -> str:
@@ -137,6 +148,19 @@ def is_boilerplate_message(text: str) -> bool:
     return stripped.startswith("<environment_context>") or stripped.startswith("# AGENTS.md instructions")
 
 
+def compact_json(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def session_id_from_path(path: Path) -> str:
+    match = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", path.name)
+    return match.group(1) if match else path.stem
+
+
 @dataclass
 class SessionSummary:
     session_id: str
@@ -151,6 +175,27 @@ class SessionSummary:
     user_messages: int
     assistant_messages: int
     searchable_text: str
+
+
+@dataclass
+class StateThreadRecord:
+    session_id: str
+    rollout_path: str
+    created_at: int
+    updated_at: int
+    source: str
+    model_provider: str
+    cwd: str
+    title: str
+    sandbox_policy: str
+    approval_mode: str
+    has_user_event: int
+    cli_version: str
+    first_user_message: str
+    model: str
+    reasoning_effort: str
+    thread_source: str
+    preview: str
 
 
 def summarize_session(path: Path, source_id: str, archive_root: Path) -> SessionSummary | None:
@@ -232,6 +277,115 @@ def summarize_session(path: Path, source_id: str, archive_root: Path) -> Session
         user_messages=user_messages,
         assistant_messages=assistant_messages,
         searchable_text="\n".join(search_parts),
+    )
+
+
+def parse_state_thread(path: Path) -> StateThreadRecord | None:
+    session_id = ""
+    created_ts = ""
+    updated_ts = ""
+    cwd = ""
+    model_provider = ""
+    source = "vscode"
+    thread_source = ""
+    cli_version = ""
+    model = ""
+    reasoning_effort = ""
+    sandbox_policy = ""
+    approval_mode = ""
+    title = ""
+    first_user_message = ""
+    preview = ""
+    user_messages = 0
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                ts = event.get("timestamp") or ""
+                if ts:
+                    created_ts = created_ts or ts
+                    updated_ts = ts
+
+                event_type = event.get("type")
+                payload = event.get("payload") or {}
+                if event_type == "session_meta" and isinstance(payload, dict):
+                    session_id = session_id or str(payload.get("id") or payload.get("session_id") or "")
+                    created_ts = created_ts or str(payload.get("timestamp") or "")
+                    cwd = str(payload.get("cwd") or cwd or "")
+                    source = str(payload.get("source") or source or "vscode")
+                    thread_source = str(payload.get("thread_source") or thread_source or "")
+                    model_provider = str(payload.get("model_provider") or model_provider or "")
+                    cli_version = str(payload.get("cli_version") or cli_version or "")
+                    continue
+
+                if event_type == "turn_context" and isinstance(payload, dict):
+                    cwd = str(payload.get("cwd") or cwd or "")
+                    model = str(payload.get("model") or model or "")
+                    reasoning_effort = str(payload.get("effort") or reasoning_effort or "")
+                    sandbox_policy = compact_json(payload.get("file_system_sandbox_policy") or payload.get("sandbox_policy") or sandbox_policy)
+                    approval_mode = compact_json(payload.get("approval_policy") or approval_mode)
+                    collaboration = payload.get("collaboration_mode")
+                    if isinstance(collaboration, dict):
+                        settings = collaboration.get("settings")
+                        if isinstance(settings, dict):
+                            reasoning_effort = str(settings.get("reasoning_effort") or reasoning_effort or "")
+                    continue
+
+                if event_type != "response_item" or not isinstance(payload, dict):
+                    continue
+                if payload.get("type") != "message":
+                    continue
+                role = payload.get("role")
+                if role not in {"user", "assistant"}:
+                    continue
+                text = extract_text(payload.get("content"))
+                if not text or is_boilerplate_message(text):
+                    continue
+                preview = preview or text[:500]
+                if role == "user":
+                    user_messages += 1
+                    if not first_user_message:
+                        first_user_message = text[:1000]
+                    if not title:
+                        title = " ".join(text.split())[:120]
+    except OSError:
+        return None
+
+    session_id = session_id or session_id_from_path(path)
+    created_at = iso_to_epoch(created_ts) or int(path.stat().st_mtime)
+    updated_at = iso_to_epoch(updated_ts) or int(path.stat().st_mtime)
+    if not title:
+        title = Path(cwd).name if cwd else session_id
+    if not sandbox_policy:
+        sandbox_policy = "{}"
+    if not approval_mode:
+        approval_mode = "on-request"
+    return StateThreadRecord(
+        session_id=session_id,
+        rollout_path=str(path),
+        created_at=created_at,
+        updated_at=updated_at,
+        source=source or "vscode",
+        model_provider=model_provider or "openai",
+        cwd=cwd,
+        title=title,
+        sandbox_policy=sandbox_policy,
+        approval_mode=approval_mode,
+        has_user_event=1 if user_messages else 0,
+        cli_version=cli_version,
+        first_user_message=first_user_message,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        thread_source=thread_source,
+        preview=preview,
     )
 
 
@@ -317,7 +471,7 @@ def read_index(vault: Path) -> list[dict[str, Any]]:
 def snapshot(args: argparse.Namespace) -> int:
     vault = Path(args.vault).expanduser()
     ensure_dir(vault)
-    sources = [Path(p).expanduser() for p in args.source]
+    sources = [Path(p).expanduser() for p in (args.source or [str(DEFAULT_CODEX_HOME)])]
     manifest_rows = []
 
     for source in sources:
@@ -417,10 +571,130 @@ def restore_archive_to_source(vault: Path, source: Path) -> dict[str, int]:
     return stats
 
 
+def current_provider_for_source(source: Path, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    config = source / "config.toml"
+    if config.exists():
+        try:
+            for raw in config.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line.startswith("model_provider"):
+                    continue
+                _, _, value = line.partition("=")
+                provider = value.strip().strip('"').strip("'")
+                if provider:
+                    return provider
+        except OSError:
+            pass
+    cc_switch_db = Path.home() / ".cc-switch" / "cc-switch.db"
+    if cc_switch_db.exists():
+        try:
+            with sqlite3.connect(f"file:{cc_switch_db}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    """
+                    SELECT id, name, category
+                    FROM providers
+                    WHERE app_type = 'codex' AND is_current = 1
+                    LIMIT 1
+                    """
+                ).fetchone()
+            if row:
+                provider_id, _name, category = [str(v or "") for v in row]
+                if provider_id not in {"codex-official", "default"} and category != "official":
+                    return "custom"
+                return "openai"
+        except sqlite3.Error:
+            pass
+    return "openai"
+
+
+def backup_state_db(db: Path, vault: Path) -> Path:
+    backup_dir = vault / "sqlite-state-backups" / now_stamp()
+    backup_path = backup_dir / db.name
+    if not backup_sqlite_file(db, backup_path):
+        raise RuntimeError(f"failed to back up state database: {db}")
+    return backup_path
+
+
+def sync_state_db(source: Path, vault: Path, provider: str) -> dict[str, Any]:
+    db = source / "sqlite" / "state_5.sqlite"
+    stats: dict[str, Any] = {
+        "db": str(db),
+        "provider": provider,
+        "parsed": 0,
+        "inserted": 0,
+        "provider_updated": 0,
+        "backup": "",
+        "skipped": False,
+    }
+    if not db.exists():
+        stats["skipped"] = True
+        return stats
+
+    records: list[StateThreadRecord] = []
+    sessions = source / "sessions"
+    if sessions.exists():
+        for path in sessions.rglob("*.jsonl"):
+            record = parse_state_thread(path)
+            if record:
+                record.model_provider = provider
+                records.append(record)
+    stats["parsed"] = len(records)
+    if not records:
+        return stats
+
+    backup_path = backup_state_db(db, vault)
+    stats["backup"] = str(backup_path)
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA busy_timeout=5000")
+        before = conn.total_changes
+        for record in records:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO threads (
+                    id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                    sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                    cli_version, first_user_message, model, reasoning_effort, thread_source,
+                    preview, created_at_ms, updated_at_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.session_id,
+                    record.rollout_path,
+                    record.created_at,
+                    record.updated_at,
+                    record.source,
+                    record.model_provider,
+                    record.cwd,
+                    record.title,
+                    record.sandbox_policy,
+                    record.approval_mode,
+                    record.has_user_event,
+                    record.cli_version,
+                    record.first_user_message,
+                    record.model,
+                    record.reasoning_effort,
+                    record.thread_source,
+                    record.preview,
+                    record.created_at * 1000,
+                    record.updated_at * 1000,
+                ),
+            )
+        stats["inserted"] = conn.total_changes - before
+        before = conn.total_changes
+        conn.execute("UPDATE threads SET model_provider = ? WHERE model_provider != ?", (provider, provider))
+        stats["provider_updated"] = conn.total_changes - before
+        conn.commit()
+    return stats
+
+
 def mirror(args: argparse.Namespace) -> int:
     snapshot(args)
     vault = Path(args.vault).expanduser()
-    sources = [Path(p).expanduser() for p in args.source]
+    sources = [Path(p).expanduser() for p in (args.source or [str(DEFAULT_CODEX_HOME)])]
     for source in sources:
         ensure_dir(source)
         stats = restore_archive_to_source(vault, source)
@@ -429,6 +703,16 @@ def mirror(args: argparse.Namespace) -> int:
             f"attachments +{stats['attachments_restored']}, images +{stats['images_restored']}, "
             f"metadata lines +{stats['metadata_lines_added']}"
         )
+        if args.sync_state_db:
+            provider = current_provider_for_source(source, args.state_provider)
+            state_stats = sync_state_db(source, vault, provider)
+            if state_stats.get("skipped"):
+                print(f"state db skipped: {state_stats['db']}")
+            else:
+                print(
+                    f"state db synced: parsed {state_stats['parsed']}, inserted {state_stats['inserted']}, "
+                    f"provider relabeled {state_stats['provider_updated']} -> {state_stats['provider']}"
+                )
     return 0
 
 
@@ -523,13 +807,15 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_snapshot = sub.add_parser("snapshot", aliases=["sync"], help="incrementally archive current Codex history")
-    p_snapshot.add_argument("--source", action="append", default=[str(DEFAULT_CODEX_HOME)], help="Codex home to archive")
+    p_snapshot.add_argument("--source", action="append", default=None, help="Codex home to archive")
     p_snapshot.add_argument("--skip-sqlite", action="store_true", help="skip SQLite snapshots for lightweight frequent sync")
     p_snapshot.set_defaults(func=snapshot)
 
     p_mirror = sub.add_parser("mirror", help="archive current history, then restore archived sessions into each source")
-    p_mirror.add_argument("--source", action="append", default=[str(DEFAULT_CODEX_HOME)], help="Codex home to archive and backfill")
+    p_mirror.add_argument("--source", action="append", default=None, help="Codex home to archive and backfill")
     p_mirror.add_argument("--skip-sqlite", action="store_true", help="skip SQLite snapshots for lightweight frequent sync")
+    p_mirror.add_argument("--sync-state-db", action="store_true", help="rebuild Codex Desktop state_5.sqlite thread index")
+    p_mirror.add_argument("--state-provider", default="auto", help="provider label for state DB rows; auto reads config.toml, defaulting to openai")
     p_mirror.set_defaults(func=mirror)
 
     p_list = sub.add_parser("list", help="list archived sessions")

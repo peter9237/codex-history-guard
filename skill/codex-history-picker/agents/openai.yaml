@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex History Picker"
+  short_description: "List local Codex chat titles safely."
+  default_prompt: "Use $codex-history-picker to list recent local Codex conversation titles, let me choose one, then show that conversation text safely."
+
+policy:
+  allow_implicit_invocation: true

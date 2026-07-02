@@ -1,184 +1,187 @@
 # Codex History Guard
 
-一个本地的 Codex Desktop 聊天记录同步、归档与回填工具。
+Local, read-first access to Codex Desktop chat history.
 
-当你使用 CC Switch 切换模型、切换 provider，或者在 Codex 里来回切换 API Key / OAuth 登录方式时，Codex 的聊天列表有时会像“消失”了一样。Codex History Guard 的作用是把本机聊天记录持续同步到一个独立的本地归档库里，并在后台把归档库里的记录回填到当前 Codex home，让你随时可以搜索、查看、恢复。
+When Codex Desktop appears to lose old conversations after switching models, CC Switch providers, API keys, or login modes, the safest recovery path is usually not to rewrite the sidebar. Instead, list local conversation titles, choose the relevant thread, and show the transcript in the current conversation.
 
-它只读取本机文件：
+This tool reads local files only:
 
-- 不调用任何模型 API
-- 不消耗 token
-- 不上传聊天内容
-- 不复制 `auth.json`
-- 不保存 API Key、OAuth token 或 cookie
-- 后台同步默认每 5 分钟运行一次
+- no model API calls
+- no token use beyond whatever text you paste/show to the model
+- no upload of chat history
+- no copy of `auth.json`
+- no API keys, OAuth tokens, or cookies copied into the vault
+- no sidebar SQLite edits for normal title/search/show usage
 
-默认归档目录：
+## Install
+
+```bash
+git clone https://github.com/peter9237/codex-history-guard.git
+cd codex-history-guard
+chmod +x install.sh scripts/*
+./install.sh
+```
+
+The installer creates:
+
+- `~/.local/bin/codex-history`
+- `~/.local/bin/codex-history-guard`
+- `${CODEX_HOME:-~/.codex}/skills/codex-history-picker`
+
+If `~/.local/bin` is not on your `PATH`, add:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+## Quick Use
+
+List recent conversation titles:
+
+```bash
+codex-history titles --limit 50
+```
+
+Example:
+
+```text
+01. 2026-07-02T01:41:31.829Z  019f1d36  我的对话咋都没呢
+02. 2026-07-01T09:48:23.893Z  019f12ae  退出 Clash Verge 进程
+```
+
+Show a selected conversation by number from the latest title list:
+
+```bash
+codex-history show 2 --limit 40
+```
+
+Or by session id prefix:
+
+```bash
+codex-history show 019f12ae --limit 40
+```
+
+Search titles and transcript text:
+
+```bash
+codex-history search "cc switch" --limit 20
+```
+
+The output is redacted by default for common API key and token patterns.
+
+## Prompt For A New Model
+
+After switching to another model/provider, tell the current model:
+
+```text
+Use codex-history-picker. First run:
+codex-history titles --limit 50
+
+Only list titles and IDs. I will choose one. Then run:
+codex-history show <id-or-number> --limit 40
+
+Do not modify state_5.sqlite or any Codex sidebar database.
+```
+
+## What Gets Indexed
+
+The tool indexes local Codex history from:
+
+```text
+${CODEX_HOME:-~/.codex}/sessions/**/*.jsonl
+${CODEX_HOME:-~/.codex}/session_index.jsonl
+${CODEX_HOME:-~/.codex}/history.jsonl
+```
+
+The default local vault is:
 
 ```text
 ~/.codex-history-vault
 ```
 
-## 适合谁
-
-如果你遇到这些情况，这个工具会有用：
-
-- 用 CC Switch 切换模型后，Codex 里的旧聊天记录看不到了
-- 从 ChatGPT 登录切到 API Key 登录后，聊天列表变了
-- 想在不同 Codex 配置状态之间保留一份统一可搜索的聊天归档
-- 想在切换模型/账号前后自动保存对话记录
-
-## 会归档什么
-
-默认会同步：
-
-- `~/.codex/sessions/`
-- `~/.codex/session_index.jsonl`
-- `~/.codex/history.jsonl`
-- `~/.codex/attachments/`
-- `~/.codex/generated_images/`
-
-完整快照模式还可以额外备份：
-
-- `~/.codex/sqlite/*.sqlite`
-
-后台自动同步使用轻量模式 `mirror --skip-sqlite`，不会每 5 分钟复制 SQLite 数据库，避免不必要的磁盘占用。
-
-如果你希望切换 provider 后 Codex Desktop 侧边栏也能看到旧对话，需要同时同步 `state_5.sqlite` 里的 `threads` 索引：
+Create or refresh the vault manually:
 
 ```bash
-./scripts/codex-history-guard mirror --skip-sqlite --sync-state-db
+codex-history snapshot --skip-sqlite
 ```
 
-这个模式会先备份 `state_5.sqlite`，再从 `sessions/*.jsonl` 补齐缺失线程，并把侧边栏线程的 `model_provider` 重标成当前 Codex provider。当前 provider 会优先从 `config.toml` 判断；如果你使用 CC Switch，则会参考 CC Switch 当前选中的 Codex provider。这样在 CC Switch/custom 和 OpenAI 之间切换时，侧边栏不会因为 provider 过滤而变空。
-
-Codex Desktop 新版本的 app-server 主要使用 `~/.codex/state_5.sqlite`；部分旧状态或兼容路径还会出现 `~/.codex/sqlite/state_5.sqlite`。`--sync-state-db` 会同时处理这两处。运行中的 app-server 可能已经缓存了线程列表，所以如果侧边栏没有立刻刷新，完全退出并重启 Codex Desktop 后再看。
-
-## macOS 自动同步安装
+## Commands
 
 ```bash
-git clone https://github.com/peter9237/codex-history-guard.git
-cd codex-history-guard
-chmod +x scripts/*
+codex-history titles --limit 50
+codex-history search "keyword" --limit 20
+codex-history show 019f1d36 --limit 40
+codex-history snapshot --skip-sqlite
+codex-history mirror --skip-sqlite
+```
+
+`titles`, `search`, and `show` are the recommended commands for day-to-day use because they do not modify Codex Desktop sidebar state.
+
+## Optional Background Archive
+
+On macOS, install the background archive job:
+
+```bash
 ./scripts/install-launchd.sh
 ```
 
-安装后会创建一个用户级 LaunchAgent，每 5 分钟运行一次：
+This creates a user LaunchAgent that runs every 5 minutes:
 
 ```bash
 codex-history-guard mirror --skip-sqlite
 ```
 
-也就是说，你切换 CC Switch 或 API 登录方式后，不需要手动输入命令，最多等 5 分钟：
+It archives and backfills session files. It does not need model tokens.
 
-- 当前 Codex home 里出现的新聊天记录会被同步到归档库
-- 归档库里已有但当前 Codex home 缺失的记录会被回填回来
-- Codex Desktop 的 SQLite 侧边栏索引会被补齐并按当前 provider 重标
-
-如果 Codex Desktop 侧边栏没有马上刷新，重启 Codex Desktop 后通常就能看到已回填的记录。
-
-自定义归档目录或同步间隔：
-
-```bash
-CODEX_HISTORY_VAULT="$HOME/Documents/codex-history" \
-CODEX_HISTORY_INTERVAL_SECONDS=600 \
-./scripts/install-launchd.sh
-```
-
-## 手动使用
-
-轻量同步当前 Codex 记录：
-
-```bash
-./scripts/codex-history-guard snapshot --skip-sqlite
-```
-
-轻量同步并回填到当前 Codex home：
-
-```bash
-./scripts/codex-history-guard mirror --skip-sqlite
-```
-
-同步文件、回填并修复侧边栏索引：
-
-```bash
-./scripts/codex-history-guard mirror --skip-sqlite --sync-state-db
-```
-
-完整同步，包括 SQLite 数据库快照：
-
-```bash
-./scripts/codex-history-guard snapshot
-```
-
-列出已归档会话：
-
-```bash
-./scripts/codex-history-guard list
-```
-
-搜索聊天记录：
-
-```bash
-./scripts/codex-history-guard search "cc switch"
-```
-
-查看某个会话全文：
-
-```bash
-./scripts/codex-history-guard show 019f1b8e
-```
-
-把某个会话恢复到当前 Codex home：
-
-```bash
-./scripts/codex-history-guard restore-session 019f1b8e
-```
-
-如果恢复后 Codex Desktop 的侧边栏没有马上刷新，重启 Codex Desktop 即可。
-
-## 包装切换命令
-
-如果你是在终端里切换模型或配置，可以用 `codex-safe-switch` 包一层。它会在切换前后各执行一次轻量同步和回填：
-
-```bash
-./scripts/codex-safe-switch cc-switch use openai
-```
-
-## 卸载后台同步
+Uninstall:
 
 ```bash
 ./scripts/uninstall-launchd.sh
 ```
 
-卸载脚本只会移除 LaunchAgent，不会删除你的聊天归档库。
+## About Sidebar Recovery
 
-## 隐私说明
+Codex Desktop sidebars are backed by `state_5.sqlite`, and rows are filtered by provider. A single thread row has one `model_provider`, so trying to make the same history appear in both OpenAI and custom providers can cause confusing UI behavior.
 
-归档库里会包含聊天文本、附件和项目上下文，因此它本身是敏感数据。建议保留在本机，或者只同步到你信任的私有备份位置。
+For that reason, this project recommends the safe flow:
 
-工具不会复制：
+1. list titles with `codex-history titles`
+2. choose a conversation
+3. show text with `codex-history show`
+4. let the current model use that text as context
 
-- `~/.codex/auth.json`
-- API Key
-- OAuth token
-- cookie
+Advanced SQLite repair commands may exist in the CLI for local recovery, but they are not the recommended public workflow. Back up before using them.
 
-## 多个 Codex Home
+## Skill
 
-如果某个切换工具改变了 `CODEX_HOME`，可以把多个 Codex home 都加入同步源：
+The repository includes a Codex skill:
 
-```bash
-./scripts/codex-history-guard mirror \
-  --source "$HOME/.codex" \
-  --source "$HOME/.codex-openai" \
-  --source "$HOME/.codex-deepseek" \
-  --skip-sqlite
+```text
+skill/codex-history-picker/SKILL.md
 ```
 
-## English Summary
+The installer copies it to:
 
-Codex History Guard archives and indexes local Codex Desktop chat history across model, provider, CC Switch, and API-key/OAuth login changes. It reads local files only, does not call model APIs, does not consume tokens, and does not copy `auth.json` or API keys.
+```text
+${CODEX_HOME:-~/.codex}/skills/codex-history-picker
+```
+
+Use it by asking:
+
+```text
+Use codex-history-picker to list my recent Codex conversation titles.
+```
+
+## Privacy
+
+Your vault contains chat text and may contain sensitive project context. Keep it local or store it only in a private, trusted location.
+
+The tool does not copy:
+
+- `auth.json`
+- API keys
+- OAuth tokens
+- cookies
 
 ## License
 

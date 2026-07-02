@@ -143,6 +143,20 @@ def extract_text(content: Any) -> str:
     return "\n".join(parts).strip()
 
 
+SENSITIVE_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-...[redacted]"),
+    (re.compile(r"\b(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token)\s*[:=]\s*[^\s,;}]+", re.I), r"\1=[redacted]"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.I), "Bearer [redacted]"),
+)
+
+
+def redact_sensitive(text: Any) -> str:
+    value = str(text or "")
+    for pattern, replacement in SENSITIVE_REPLACEMENTS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
 def is_boilerplate_message(text: str) -> bool:
     stripped = text.lstrip()
     return stripped.startswith("<environment_context>") or stripped.startswith("# AGENTS.md instructions")
@@ -445,8 +459,8 @@ def write_search_md(vault: Path, rows: list[dict[str, Any]]) -> None:
         "| --- | --- | --- | --- | --- |",
     ]
     for row in rows:
-        title = str(row.get("title") or "").replace("|", "\\|").replace("\n", " ")
-        cwd = str(row.get("cwd") or "").replace("|", "\\|")
+        title = redact_sensitive(row.get("title")).replace("|", "\\|").replace("\n", " ")
+        cwd = redact_sensitive(row.get("cwd")).replace("|", "\\|")
         lines.append(
             f"| {row.get('last_ts') or row.get('first_ts') or ''} | {title[:120]} | "
             f"{row.get('source_id') or ''} | `{cwd}` | `{row.get('session_id') or ''}` |"
@@ -466,6 +480,24 @@ def read_index(vault: Path) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
     return rows
+
+
+def row_time(row: dict[str, Any]) -> str:
+    return str(row.get("last_ts") or row.get("first_ts") or "")
+
+
+def short_session_id(row: dict[str, Any]) -> str:
+    return str(row.get("session_id") or "")[:8]
+
+
+def print_title_rows(rows: list[dict[str, Any]], limit: int, numbered: bool = True) -> None:
+    selected = rows[:limit]
+    for idx, row in enumerate(selected, start=1):
+        title = " ".join(redact_sensitive(row.get("title")).split())
+        if numbered:
+            print(f"{idx:02d}. {row_time(row)}  {short_session_id(row)}  {title}")
+        else:
+            print(f"{row_time(row)}  {row.get('session_id')}  {title}")
 
 
 def snapshot(args: argparse.Namespace) -> int:
@@ -747,10 +779,15 @@ def mirror(args: argparse.Namespace) -> int:
     return 0
 
 
+def titles(args: argparse.Namespace) -> int:
+    rows = read_index(Path(args.vault).expanduser())[: args.limit]
+    print_title_rows(rows, args.limit, numbered=not args.plain)
+    return 0
+
+
 def list_sessions(args: argparse.Namespace) -> int:
     rows = read_index(Path(args.vault).expanduser())[: args.limit]
-    for row in rows:
-        print(f"{row.get('last_ts') or row.get('first_ts') or ''}  {row.get('session_id')}  {row.get('title')}")
+    print_title_rows(rows, args.limit, numbered=False)
     return 0
 
 
@@ -765,15 +802,22 @@ def search(args: argparse.Namespace) -> int:
         ).lower()
         if query in haystack:
             hits.append(row)
-    for row in hits[: args.limit]:
-        print(f"{row.get('last_ts') or row.get('first_ts') or ''}  {row.get('session_id')}  {row.get('title')}")
-        print(f"  cwd: {row.get('cwd')}")
+    print_title_rows(hits, args.limit, numbered=not args.plain)
+    if args.cwd:
+        for row in hits[: args.limit]:
+            print(f"    cwd: {redact_sensitive(row.get('cwd'))}")
     print(f"hits: {len(hits)}")
     return 0
 
 
 def find_session(vault: Path, needle: str) -> dict[str, Any] | None:
-    for row in read_index(vault):
+    rows = read_index(vault)
+    if needle.isdigit():
+        idx = int(needle) - 1
+        if 0 <= idx < len(rows):
+            return rows[idx]
+        return None
+    for row in rows:
         sid = str(row.get("session_id") or "")
         title = str(row.get("title") or "")
         if sid == needle or sid.startswith(needle) or needle.lower() in title.lower():
@@ -806,6 +850,8 @@ def show(args: argparse.Namespace) -> int:
             text = extract_text(payload.get("content"))
             if not text:
                 continue
+            if not args.no_redact:
+                text = redact_sensitive(text)
             print(f"\n[{role}] {event.get('timestamp') or ''}\n{text}")
             printed += 1
             if args.limit and printed >= args.limit:
@@ -833,7 +879,7 @@ def restore(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Archive, search, and restore Codex Desktop chat history.")
+    parser = argparse.ArgumentParser(description="Archive, search, and safely inspect local Codex Desktop chat history.")
     parser.add_argument("--vault", default=str(DEFAULT_VAULT), help=f"history vault path (default: {DEFAULT_VAULT})")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -849,18 +895,26 @@ def main(argv: list[str] | None = None) -> int:
     p_mirror.add_argument("--state-provider", default="auto", help="provider label for state DB rows; auto reads config.toml, defaulting to openai")
     p_mirror.set_defaults(func=mirror)
 
-    p_list = sub.add_parser("list", help="list archived sessions")
+    p_titles = sub.add_parser("titles", help="show recent archived conversation titles with stable numbers")
+    p_titles.add_argument("--limit", type=int, default=50)
+    p_titles.add_argument("--plain", action="store_true", help="omit row numbers for script-friendly output")
+    p_titles.set_defaults(func=titles)
+
+    p_list = sub.add_parser("list", help="list archived sessions without row numbers")
     p_list.add_argument("--limit", type=int, default=30)
     p_list.set_defaults(func=list_sessions)
 
     p_search = sub.add_parser("search", help="search archived sessions")
     p_search.add_argument("query", nargs="+")
     p_search.add_argument("--limit", type=int, default=20)
+    p_search.add_argument("--plain", action="store_true", help="omit row numbers for script-friendly output")
+    p_search.add_argument("--cwd", action="store_true", help="print matching session working directories")
     p_search.set_defaults(func=search)
 
     p_show = sub.add_parser("show", help="print a session transcript")
-    p_show.add_argument("session", help="session id prefix or title substring")
+    p_show.add_argument("session", help="session id prefix, title substring, or number from `titles` output")
     p_show.add_argument("--limit", type=int, default=0, help="max messages to print")
+    p_show.add_argument("--no-redact", action="store_true", help="print raw text without API-key/token redaction")
     p_show.set_defaults(func=show)
 
     p_restore = sub.add_parser("restore-session", help="restore one archived session into a Codex home")
